@@ -1,0 +1,305 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { requireAuth } from '@/core/middleware/auth';
+import { getUserWithRoles, updateUser, deleteUser } from '@/core/lib/services/usersService';
+import { getUserTenantId, userHasPermission, userBelongsToTenant } from '@/core/lib/permissions';
+import { db } from '@/core/lib/db';
+import { users } from '@/core/lib/db/baseSchema';
+import { eq, and, isNull } from 'drizzle-orm';
+
+/**
+ * GET /api/users/:id
+ * Get a single user by ID
+ * Requires: users:read permission
+ * Tenant isolation: Non-super-admin users can only view users in their tenant
+ */
+export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    // Verify authentication
+    const authMiddleware = requireAuth();
+    const authResult = await authMiddleware(request);
+    
+    if (authResult instanceof NextResponse) {
+      return authResult; // Unauthorized response
+    }
+    
+    const userId = authResult;
+    
+    // Check permission
+    const hasPermission = await userHasPermission(userId, 'users:read');
+    
+    if (!hasPermission) {
+      return NextResponse.json(
+        { error: 'Forbidden - Insufficient permissions. users:read permission required.' },
+        { status: 403 }
+      );
+    }
+    
+    const { id } = await params;
+    
+    // Get user
+    const result = await getUserWithRoles(id);
+    
+    if (!result) {
+      return NextResponse.json(
+        { error: 'User not found' },
+        { status: 404 }
+      );
+    }
+    
+    // Tenant isolation check
+    const userTenantId = await getUserTenantId(userId);
+    if (userTenantId !== null && result.user.tenantId !== userTenantId) {
+      return NextResponse.json(
+        { error: 'Forbidden - You can only view users in your tenant' },
+        { status: 403 }
+      );
+    }
+    
+    // Remove password hash and sensitive data from response
+    const { passwordHash, twoFactorSecret, ...userWithoutPassword } = result.user;
+    
+    return NextResponse.json(
+      {
+        success: true,
+        data: {
+          ...userWithoutPassword,
+          roles: result.roles,
+          tenant: result.tenant,
+        },
+      },
+      { status: 200 }
+    );
+  } catch (error) {
+    console.error('Get user by ID error:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}
+
+/**
+ * PATCH /api/users/:id
+ * Update a user
+ * Requires: users:update permission
+ * Tenant isolation: Non-super-admin users can only update users in their tenant
+ */
+export async function PATCH(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    // Verify authentication
+    const authMiddleware = requireAuth();
+    const authResult = await authMiddleware(request);
+    
+    if (authResult instanceof NextResponse) {
+      return authResult; // Unauthorized response
+    }
+    
+    const userId = authResult;
+    
+    // Check permission
+    const hasPermission = await userHasPermission(userId, 'users:update');
+    
+    if (!hasPermission) {
+      return NextResponse.json(
+        { error: 'Forbidden - Insufficient permissions. users:update permission required.' },
+        { status: 403 }
+      );
+    }
+    
+    const { id } = await params;
+    
+    // Get target user
+    const targetUser = await db
+      .select()
+      .from(users)
+      .where(and(eq(users.id, id), isNull(users.deletedAt)))
+      .limit(1);
+    
+    if (targetUser.length === 0) {
+      return NextResponse.json(
+        { error: 'User not found' },
+        { status: 404 }
+      );
+    }
+    
+    // Tenant isolation check
+    const userTenantId = await getUserTenantId(userId);
+    if (userTenantId !== null && targetUser[0].tenantId !== userTenantId) {
+      return NextResponse.json(
+        { error: 'Forbidden - You can only update users in your tenant' },
+        { status: 403 }
+      );
+    }
+    
+    // Parse and validate request body
+    const body = await request.json();
+    console.log('[User Update] Request body:', body);
+    
+    const { validateRequest } = await import('@/core/middleware/validation');
+    const { updateUserSchema } = await import('@/core/lib/validations/users');
+    const validation = validateRequest(updateUserSchema, body);
+    
+    if (!validation.success) {
+      console.log('[User Update] Validation failed:', validation.error.errors);
+      return NextResponse.json(
+        {
+          error: 'Validation failed',
+          details: validation.error.errors,
+        },
+        { status: 400 }
+      );
+    }
+    
+    const data = validation.data;
+    console.log('[User Update] Validated data:', data);
+    
+    // Check if email is being changed and if it's already taken
+    if (data.email) {
+      const existingUser = await db
+        .select()
+        .from(users)
+        .where(eq(users.email, data.email))
+        .limit(1);
+      
+      if (existingUser.length > 0 && existingUser[0].id !== id) {
+        return NextResponse.json(
+          { error: 'Email already registered' },
+          { status: 409 }
+        );
+      }
+    }
+    
+    // Update user
+    const user = await updateUser(id, data, userId);
+    
+    if (!user) {
+      return NextResponse.json(
+        { error: 'User not found' },
+        { status: 404 }
+      );
+    }
+    
+    // Remove password hash from response
+    const { passwordHash, twoFactorSecret, ...userWithoutPassword } = user;
+    
+    return NextResponse.json(
+      {
+        success: true,
+        data: userWithoutPassword,
+      },
+      { status: 200 }
+    );
+  } catch (error) {
+    console.error('Update user error:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}
+
+/**
+ * DELETE /api/users/:id
+ * Delete a user (soft delete)
+ * Requires: users:delete permission
+ * Tenant isolation: Non-super-admin users can only delete users in their tenant
+ */
+export async function DELETE(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    // Verify authentication
+    const authMiddleware = requireAuth();
+    const authResult = await authMiddleware(request);
+    
+    if (authResult instanceof NextResponse) {
+      return authResult; // Unauthorized response
+    }
+    
+    const userId = authResult;
+    
+    // Check permission
+    const hasPermission = await userHasPermission(userId, 'users:delete');
+    
+    console.log('[User Delete] Permission check:', { userId, hasPermission });
+    
+    if (!hasPermission) {
+      return NextResponse.json(
+        { error: 'Forbidden - Insufficient permissions. users:delete permission required.' },
+        { status: 403 }
+      );
+    }
+    
+    const { id } = await params;
+    
+    console.log('[User Delete] Attempting to delete user:', id, 'by:', userId);
+    
+    // Prevent self-deletion
+    if (id === userId) {
+      return NextResponse.json(
+        { error: 'You cannot delete your own account' },
+        { status: 400 }
+      );
+    }
+    
+    // Get target user
+    const targetUser = await db
+      .select()
+      .from(users)
+      .where(and(eq(users.id, id), isNull(users.deletedAt)))
+      .limit(1);
+    
+    console.log('[User Delete] Target user found:', targetUser.length > 0);
+    
+    if (targetUser.length === 0) {
+      return NextResponse.json(
+        { error: 'User not found' },
+        { status: 404 }
+      );
+    }
+    
+    // Tenant isolation check
+    const userTenantId = await getUserTenantId(userId);
+    console.log('[User Delete] Tenant check:', { userTenantId, targetTenantId: targetUser[0].tenantId });
+    
+    if (userTenantId !== null && targetUser[0].tenantId !== userTenantId) {
+      return NextResponse.json(
+        { error: 'Forbidden - You can only delete users in your tenant' },
+        { status: 403 }
+      );
+    }
+    
+    // Delete user
+    const success = await deleteUser(id, userId);
+    
+    console.log('[User Delete] Delete result:', success);
+    
+    if (!success) {
+      return NextResponse.json(
+        { error: 'User not found' },
+        { status: 404 }
+      );
+    }
+    
+    return NextResponse.json(
+      {
+        success: true,
+        message: 'User deleted successfully',
+      },
+      { status: 200 }
+    );
+  } catch (error) {
+    console.error('[User Delete] Error:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}
